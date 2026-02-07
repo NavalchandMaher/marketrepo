@@ -6,6 +6,7 @@ from fastapi import FastAPI
 from datetime import datetime
 
 from fastapi.middleware.cors import CORSMiddleware
+from exchanges.binance_testnet import get_binance_testnet
 
 app = FastAPI()
 
@@ -146,3 +147,12 @@ def analysis():
         return {
             "error": str(e)
         }
+
+@app.get("/")
+def root():
+    return {"status": "Market API running"}
+
+@app.get("/symbols")
+def get_symbols():
+    exchange = get_binance_testnet()
+    return list(exchange.symbols)[:20]
