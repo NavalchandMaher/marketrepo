@@ -16,8 +16,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-exchange = ccxt.bybit({
-    "options": {"defaultType": "linear"}
+exchange = ccxt.binance({
+    "options": {"defaultType": "future"},
+    "urls": {
+        "api": {
+            "public": "https://testnet.binancefuture.com/fapi/v1",
+            "private": "https://testnet.binancefuture.com/fapi/v1"
+        }
+    }
 })
 
 
