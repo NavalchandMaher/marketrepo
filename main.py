@@ -16,7 +16,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-exchange = ccxt.binance({"options": {"defaultType": "future"}})
+exchange = ccxt.bybit({
+    "options": {"defaultType": "linear"}
+})
+
 
 LAST_OI = {}
 LAST_PRICE = {}
