@@ -1,158 +1,210 @@
 import ccxt
 import pandas as pd
 import ta
-import numpy as np
-from fastapi import FastAPI
-from datetime import datetime
-
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
-from exchanges.binance_testnet import get_binance_testnet
+import requests
+import time
 
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-    ],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-exchange = ccxt.binance()
+exchange = ccxt.binance({"options": {"defaultType": "future"}})
 
-SYMBOL = "ETH/USDT"
-TIMEFRAME = "15m"
-LIMIT = 120
+LAST_OI = {}
+LAST_PRICE = {}
 
-LAST_SIGNAL = "WAIT"
+VALID_TF = ["1m","3m","5m","15m","30m","1h","2h","4h","1d"]
 
-# ---------------- DATA ----------------
-def get_data():
-    bars = exchange.fetch_ohlcv(SYMBOL, timeframe=TIMEFRAME, limit=LIMIT)
+def safe(v, d=0):
+    try:
+        if pd.isna(v):
+            return d
+        return float(v)
+    except:
+        return d
+
+def validate_tf(tf):
+    return tf if tf in VALID_TF else "5m"
+
+def get_pcr(symbol):
+    try:
+        currency = "BTC" if "BTC" in symbol else "ETH"
+        url = f"https://www.deribit.com/api/v2/public/get_book_summary_by_currency?currency={currency}&kind=option"
+        data = requests.get(url, timeout=5).json()["result"]
+
+        call = 0
+        put = 0
+
+        for i in data:
+            oi = float(i["open_interest"])
+            if i["instrument_name"].endswith("C"):
+                call += oi
+            else:
+                put += oi
+
+        return put / call if call else 1
+    except:
+        return 1
+
+def get_oi(symbol, price):
+    try:
+        data = exchange.fetch_open_interest(symbol)
+        current = safe(data.get("openInterest", 0))
+
+        prev_oi = LAST_OI.get(symbol, current)
+        prev_price = LAST_PRICE.get(symbol, price)
+
+        LAST_OI[symbol] = current
+        LAST_PRICE[symbol] = price
+
+        oi_change = ((current - prev_oi) / current * 100) if current else 0
+
+        return current, oi_change, prev_price
+    except:
+        return 0, 0, price
+
+@app.get("/analysis")
+def analysis(symbol: str = Query("BTCUSDT"),
+             timeframe: str = Query("5m")):
+
+    timeframe = validate_tf(timeframe)
+
+    pair = symbol.replace("USDT","/USDT")
+
+    # Main timeframe
+    bars = exchange.fetch_ohlcv(pair, timeframe=timeframe, limit=250)
+
     df = pd.DataFrame(
-        bars, columns=["time", "open", "high", "low", "close", "volume"]
+        bars,
+        columns=["time","open","high","low","close","volume"]
     )
-    return df
 
-# ---------------- INDICATORS ----------------
-def add_indicators(df):
+    if len(df) < 100:
+        return {"error": "Not enough data"}
+
+    # Higher timeframe filter
+    try:
+        bars_htf = exchange.fetch_ohlcv(pair, timeframe="1h", limit=200)
+        df_htf = pd.DataFrame(
+            bars_htf,
+            columns=["time","open","high","low","close","volume"]
+        )
+        df_htf["ema50"] = df_htf["close"].ewm(span=50).mean()
+        htf_trend = "BULLISH" if df_htf.iloc[-2]["close"] > df_htf.iloc[-2]["ema50"] else "BEARISH"
+    except:
+        htf_trend = "NEUTRAL"
+
+    # Indicators
+    df["ema20"] = df["close"].ewm(span=20).mean()
+    df["ema50"] = df["close"].ewm(span=50).mean()
     df["rsi"] = ta.momentum.RSIIndicator(df["close"]).rsi()
+
+    macd = ta.trend.MACD(df["close"])
+    df["macd"] = macd.macd()
+    df["macd_signal"] = macd.macd_signal()
+
+    adx_ind = ta.trend.ADXIndicator(df["high"], df["low"], df["close"])
+    df["adx"] = adx_ind.adx()
 
     bb = ta.volatility.BollingerBands(df["close"])
     df["bb_high"] = bb.bollinger_hband()
     df["bb_low"] = bb.bollinger_lband()
-    df["bb_width"] = df["bb_high"] - df["bb_low"]
 
-    return df
+    candle = df.iloc[-2]
 
-# ---------------- SUPPORT / RESISTANCE ----------------
-def support_resistance(df, lookback=20):
-    support = df["low"].rolling(lookback).min().iloc[-2]
-    resistance = df["high"].rolling(lookback).max().iloc[-2]
-    return round(support, 2), round(resistance, 2)
+    price = safe(candle["close"])
+    ema20 = safe(candle["ema20"])
+    ema50 = safe(candle["ema50"])
+    rsi = safe(candle["rsi"])
+    macd_val = safe(candle["macd"])
+    macd_sig = safe(candle["macd_signal"])
+    adx = safe(candle["adx"])
+    bb_high = safe(candle["bb_high"])
+    bb_low = safe(candle["bb_low"])
 
-# ---------------- OI MODULE ----------------
-def get_oi_bias():
-    # Placeholder – safe, architecture-ready
-    return {
-        "oi_trend": "Increasing",
-        "oi_bias": "Bearish"
-    }
+    vol_avg = safe(df["volume"].rolling(20).mean().iloc[-2], 1)
+    volume_ratio = safe(candle["volume"]) / vol_avg if vol_avg else 1
 
-# ---------------- SIGNAL ENGINE (CANDLE CLOSE ONLY) ----------------
-def generate_signal(df):
-    candle = df.iloc[-2]  # CLOSED candle only
+    pcr = get_pcr(symbol)
+    futures_oi, oi_change, prev_price = get_oi(symbol, price)
 
-    price = candle["close"]
-    rsi = candle["rsi"]
+    score = 0
+    max_score = 12
 
-    bb_width_now = candle["bb_width"]
-    bb_width_prev = df["bb_width"].iloc[-7]
+    # EMA Trend
+    score += 2 if ema20 > ema50 else -2
 
-    support, resistance = support_resistance(df)
-    oi_data = get_oi_bias()   # 👈 OI fetched HERE
+    # RSI
+    if rsi < 30: score += 2
+    elif rsi < 40: score += 1
+    elif rsi > 70: score -= 2
+    elif rsi > 60: score -= 1
 
-    trend = "Sideways"
-    signal = "WAIT"
-    confidence = 50
+    # MACD
+    score += 1 if macd_val > macd_sig else -1
 
-    # SELL
-    if (
-        price < support
-        and rsi < 45
-        and bb_width_now > bb_width_prev
-        and oi_data["oi_bias"] == "Bearish"
-    ):
-        signal = "SELL"
-        trend = "Bearish"
-        confidence = 85
+    # Bollinger
+    if price < bb_low: score += 1
+    if price > bb_high: score -= 1
 
-    # BUY
-    elif (
-        price > resistance
-        and rsi > 60
-        and bb_width_now > bb_width_prev
-        and oi_data["oi_bias"] == "Bullish"
-    ):
+    # OI + Price logic
+    if price > prev_price and oi_change > 1:
+        score += 2
+    elif price < prev_price and oi_change > 1:
+        score -= 2
+
+    # PCR
+    if pcr > 1.2: score += 1
+    elif pcr < 0.8: score -= 1
+
+    # Volume
+    if volume_ratio > 1.3: score += 1
+
+    # HTF confirmation
+    if htf_trend == "BULLISH": score += 1
+    elif htf_trend == "BEARISH": score -= 1
+
+    # Regime
+    regime = "TRENDING" if adx > 25 else "RANGING"
+
+    # Final signal
+    if score >= 4:
         signal = "BUY"
-        trend = "Bullish"
-        confidence = 85
+    elif score <= -4:
+        signal = "SELL"
+    else:
+        signal = "WAIT"
 
-    # 🔑 OI fields are ADDED TO RESULT HERE
+    confidence = min(95, int((abs(score) / max_score) * 100))
+
+    chart = df.tail(100)[
+        ["time","close","ema20","ema50","bb_high","bb_low"]
+    ].values.tolist()
+
     return {
-        "symbol": "ETHUSDT",
-        "price": round(price, 2),
-        "rsi": round(rsi, 2),
-        "support": support,
-        "resistance": resistance,
-        "trend": trend,
         "signal": signal,
         "confidence": confidence,
-        "oi_bias": oi_data["oi_bias"],
-        "oi_trend": oi_data["oi_trend"]
+        "reason": f"Multi-factor confluence score: {score}",
+        "market_regime": regime,
+        "htf_trend": htf_trend,
+
+        "price": round(price,2),
+        "ema20": round(ema20,2),
+        "ema50": round(ema50,2),
+        "rsi": round(rsi,2),
+        "macd": round(macd_val,3),
+        "adx": round(adx,2),
+        "volume_ratio": round(volume_ratio,2),
+        "pcr": round(pcr,2),
+        "oi_change_pct": round(oi_change,2),
+
+        "chart": chart
     }
-
-# ---------------- API ----------------
-@app.get("/analysis")
-def analysis():
-    global LAST_SIGNAL
-
-    try:
-        df = get_data()
-        df = add_indicators(df)
-
-        # generate_signal already contains OI
-        result = generate_signal(df)
-
-        # -------- TIME FILTER (9 AM – 11 PM IST) --------
-        hour = datetime.now().hour
-        if hour < 9 or hour > 23:
-            result["alert"] = False
-            result["signal"] = "WAIT"
-            return result
-
-        # -------- ALERT ONLY ON NEW BUY / SELL --------
-        alert = False
-        if result["signal"] in ["BUY", "SELL"] and result["signal"] != LAST_SIGNAL:
-            alert = True
-            LAST_SIGNAL = result["signal"]
-
-        result["alert"] = alert
-        return result
-
-    except Exception as e:
-        return {
-            "error": str(e)
-        }
-
-@app.get("/")
-def root():
-    return {"status": "Market API running"}
-
-@app.get("/symbols")
-def get_symbols():
-    exchange = get_binance_testnet()
-    return list(exchange.symbols)[:20]
